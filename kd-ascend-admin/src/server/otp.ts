@@ -1,0 +1,450 @@
+import 'server-only';
+import { FieldValue, Timestamp } from 'firebase-admin/firestore';
+import type { UserRecord } from 'firebase-admin/auth';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { adminAuth, adminDb, mailSettings } from './admin';
+import { sendResetEmail, sendTemplate, sendVerificationEmail, type MailConfig } from './email';
+import { firstName } from './emailTemplates';
+
+/**
+ * Same behaviour as the Cloud Functions in the mobile project (functions/src/index.ts),
+ * running inside this Next.js app instead so it works on Firebase's free plan.
+ *
+ * Codes are stored hashed in otp/{purpose}_{uid} (clients can't read them — see firestore.rules),
+ * expire after 10 minutes, can be resent every 30 seconds, and lock for 30 minutes after 5 wrong tries.
+ */
+
+/** Error with a Firebase-style code; the app's error messages are keyed on these. */
+export class FnError extends Error {
+  constructor(
+    public code:
+      | 'invalid-argument'
+      | 'unauthenticated'
+      | 'not-found'
+      | 'failed-precondition'
+      | 'permission-denied'
+      | 'unavailable'
+      | 'internal',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+const CODE_TTL_MS = 10 * 60 * 1000;
+const RESEND_COOLDOWN_S = 30;
+const MAX_ATTEMPTS = 5;
+const LOCK_MS = 30 * 60 * 1000;
+const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
+/** "This link will expire in 24 hours" (Figma Password Reset Request email). */
+const RESET_LINK_TTL_MS = 24 * 60 * 60 * 1000;
+
+const appUrl = () => (process.env.APP_URL || 'https://kd-ascend.vercel.app').replace(/\/+$/, '');
+
+type Purpose = 'verify_email' | 'reset_password' | 'reset_sms_test';
+
+type SendResult =
+  | { status: 'sent'; destination: string; cooldownSeconds: number }
+  | { status: 'cooldown'; destination: string; retryAfterSeconds: number }
+  | { status: 'locked'; retryAfterSeconds: number }
+  | { status: 'already-verified' };
+
+type VerifyResult =
+  | { status: 'ok' }
+  | { status: 'incorrect'; attemptsLeft: number }
+  | { status: 'locked'; retryAfterSeconds: number }
+  | { status: 'expired' };
+
+type OtpDoc = {
+  uid: string;
+  purpose: Purpose;
+  codeHash: string | null;
+  salt: string | null;
+  expiresAt: Timestamp | null;
+  attempts: number;
+  lockedUntil: Timestamp | null;
+  lastSentAt: Timestamp | null;
+};
+
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
+const secondsUntil = (t: Timestamp, now: number) => Math.max(1, Math.ceil((t.toMillis() - now) / 1000));
+const otpRef = (purpose: Purpose, uid: string) => adminDb().collection('otp').doc(`${purpose}_${uid}`);
+const isE164 = (v: string) => /^\+[1-9]\d{7,14}$/.test(v);
+
+export function maskEmail(email: string) {
+  const [name, domain] = email.split('@');
+  if (!domain) return email;
+  const visible = name.length <= 2 ? name[0] : name.slice(0, 2);
+  return `${visible}${'*'.repeat(Math.max(2, name.length - visible.length))}@${domain}`;
+}
+
+function requireString(data: Record<string, unknown>, key: string, max = 320): string {
+  const value = data[key];
+  if (typeof value !== 'string' || !value.trim() || value.length > max) {
+    throw new FnError('invalid-argument', `Missing or invalid "${key}".`);
+  }
+  return value.trim();
+}
+
+function requireCode(data: Record<string, unknown>) {
+  const code = requireString(data, 'code', 6);
+  if (!/^\d{6}$/.test(code)) throw new FnError('invalid-argument', 'The code must be 6 digits.');
+  return code;
+}
+
+async function findUser(identifier: string): Promise<UserRecord | null> {
+  try {
+    if (identifier.includes('@')) return await adminAuth().getUserByEmail(identifier.toLowerCase());
+    if (!isE164(identifier)) throw new FnError('invalid-argument', 'Please enter a valid email address or phone number.');
+    return await adminAuth().getUserByPhoneNumber(identifier);
+  } catch (e) {
+    if ((e as { code?: string }).code !== 'auth/user-not-found') throw e;
+  }
+  // Test OTP mode never links the phone to the Auth account, so also look up the
+  // number saved on the profile (users/{uid}.phone) at sign-up.
+  // Test accounts can share a number; pick the most complete one (approved first, then waiting
+  // for review, …, unfinished sign-ups last; newest wins a tie).
+  const snap = await adminDb().collection('users').where('phone', '==', identifier).limit(20).get();
+  const rank: Record<string, number> = { approved: 0, under_review: 1, rejected: 2, blacklisted: 3, incomplete: 4 };
+  const candidates = snap.docs
+    .map((d) => {
+      const u = d.data() as { status?: string; onboardingStep?: string; createdAt?: Timestamp };
+      return {
+        uid: d.id,
+        rank: (rank[u.status ?? 'incomplete'] ?? 5) * 2 + (u.onboardingStep === 'done' ? 0 : 1),
+        created: u.createdAt?.toMillis?.() ?? 0,
+      };
+    })
+    .sort((a, b) => a.rank - b.rank || b.created - a.created);
+  for (const c of candidates) {
+    try {
+      return await adminAuth().getUser(c.uid);
+    } catch (e) {
+      if ((e as { code?: string }).code !== 'auth/user-not-found') throw e;
+    }
+  }
+  return null;
+}
+
+async function issueCode(
+  purpose: Purpose,
+  user: UserRecord,
+  send: (cfg: MailConfig, to: string, code: string, name?: string | null) => Promise<void>,
+): Promise<SendResult> {
+  const cfg = mailSettings();
+  const email = user.email!;
+  const destination = maskEmail(email);
+  const ref = otpRef(purpose, user.uid);
+  const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+  const salt = randomBytes(16).toString('hex');
+  const now = Date.now();
+
+  const outcome = await adminDb().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const cur = snap.data() as OtpDoc | undefined;
+    if (cur?.lockedUntil && cur.lockedUntil.toMillis() > now) {
+      return { status: 'locked', retryAfterSeconds: secondsUntil(cur.lockedUntil, now) } as const;
+    }
+    if (cur?.lastSentAt && now - cur.lastSentAt.toMillis() < RESEND_COOLDOWN_S * 1000) {
+      const left = Math.ceil((cur.lastSentAt.toMillis() + RESEND_COOLDOWN_S * 1000 - now) / 1000);
+      return { status: 'cooldown', destination, retryAfterSeconds: left } as const;
+    }
+    const doc: OtpDoc = {
+      uid: user.uid,
+      purpose,
+      codeHash: sha256(`${salt}:${code}`),
+      salt,
+      expiresAt: Timestamp.fromMillis(now + CODE_TTL_MS),
+      attempts: 0,
+      lockedUntil: null,
+      lastSentAt: Timestamp.fromMillis(now),
+    };
+    tx.set(ref, doc);
+    return null;
+  });
+  if (outcome) return outcome;
+
+  try {
+    await send(cfg, email, code, await displayName(user));
+  } catch (e) {
+    console.error('Email send failed', e);
+    await ref.delete().catch(() => undefined);
+    throw new FnError('unavailable', 'We couldn’t send the email right now. Please try again.');
+  }
+  return { status: 'sent', destination, cooldownSeconds: RESEND_COOLDOWN_S };
+}
+
+/** First name for "Hey, Nawal 👋": profile name from onboarding, else the Auth display name. */
+async function displayName(user: UserRecord): Promise<string | null> {
+  try {
+    const snap = await adminDb().doc(`users/${user.uid}`).get();
+    const profile = snap.get('profile') as { fullName?: string } | undefined;
+    return firstName(profile?.fullName) || firstName(user.displayName) || null;
+  } catch {
+    return firstName(user.displayName) || null;
+  }
+}
+
+/** Sends a template to a user without ever failing the request that triggered it. */
+export async function notifyUser(uid: string, template: Parameters<typeof sendTemplate>[2], vars: Record<string, string | null> = {}) {
+  try {
+    const user = await adminAuth().getUser(uid);
+    if (!user.email) return false;
+    await sendTemplate(mailSettings(), user.email, template, { name: await displayName(user), ...vars });
+    return true;
+  } catch (e) {
+    console.error(`[email] ${template} to ${uid} failed`, e);
+    return false;
+  }
+}
+
+async function checkCode(purpose: Purpose, uid: string, code: string): Promise<VerifyResult> {
+  const ref = otpRef(purpose, uid);
+  const now = Date.now();
+  return adminDb().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const cur = snap.data() as OtpDoc | undefined;
+    if (!cur) return { status: 'expired' } as const;
+    if (cur.lockedUntil && cur.lockedUntil.toMillis() > now) {
+      return { status: 'locked', retryAfterSeconds: secondsUntil(cur.lockedUntil, now) } as const;
+    }
+    if (!cur.codeHash || !cur.salt || !cur.expiresAt || cur.expiresAt.toMillis() < now) {
+      return { status: 'expired' } as const;
+    }
+    if (sha256(`${cur.salt}:${code}`) === cur.codeHash) {
+      tx.delete(ref);
+      return { status: 'ok' } as const;
+    }
+    const attempts = (cur.attempts ?? 0) + 1;
+    if (attempts >= MAX_ATTEMPTS) {
+      tx.set(ref, { ...cur, attempts: 0, codeHash: null, salt: null, lockedUntil: Timestamp.fromMillis(now + LOCK_MS) });
+      return { status: 'locked', retryAfterSeconds: LOCK_MS / 1000 } as const;
+    }
+    tx.update(ref, { attempts });
+    return { status: 'incorrect', attemptsLeft: MAX_ATTEMPTS - attempts } as const;
+  });
+}
+
+async function isSamePassword(email: string, password: string): Promise<boolean> {
+  const key = process.env.NEXT_PUBLIC_FIREBASE_API_KEY || process.env.WEB_API_KEY || 'AIzaSyCnTcGSxKypGfyY5vPc99HPPwnZndDzkV0';
+  try {
+    const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${key}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: false }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * TEST MODE ONLY: fixed SMS code for "Forgot Password → Via SMS".
+ * Turned on by setting the Vercel environment variable TEST_SMS_OTP (e.g. 123456).
+ * No SMS is sent; the app asks for that code instead. Remove the variable before launch:
+ * while it is set, anyone who knows a registered phone number can reset that account.
+ */
+function testSmsCode(): string {
+  const code = (process.env.TEST_SMS_OTP || '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    throw new FnError('failed-precondition', 'SMS test mode is off on the server (TEST_SMS_OTP is not set).');
+  }
+  return code;
+}
+
+type Handler = (data: Record<string, unknown>, uid: string | null) => Promise<unknown>;
+
+function requireAuth(uid: string | null) {
+  if (!uid) throw new FnError('unauthenticated', 'Please sign in again.');
+  return uid;
+}
+
+/** The same function names the mobile app already calls. */
+export const handlers: Record<string, Handler> = {
+  async isPhoneAvailable(data) {
+    const phone = requireString(data, 'phone', 16);
+    if (!isE164(phone)) throw new FnError('invalid-argument', 'Please enter a valid phone number.');
+    try {
+      await adminAuth().getUserByPhoneNumber(phone);
+      return { available: false };
+    } catch (e) {
+      if ((e as { code?: string }).code === 'auth/user-not-found') return { available: true };
+      throw e;
+    }
+  },
+
+  async sendEmailVerificationCode(_data, uidOrNull) {
+    const uid = requireAuth(uidOrNull);
+    const user = await adminAuth().getUser(uid);
+    if (!user.email) throw new FnError('failed-precondition', 'This account has no email address.');
+    if (user.emailVerified) {
+      await adminDb().doc(`users/${uid}`).set({ emailVerified: true }, { merge: true });
+      return { status: 'already-verified' } satisfies SendResult;
+    }
+    return issueCode('verify_email', user, sendVerificationEmail);
+  },
+
+  async verifyEmailCode(data, uidOrNull) {
+    const uid = requireAuth(uidOrNull);
+    const code = requireCode(data);
+    const result = await checkCode('verify_email', uid, code);
+    if (result.status === 'ok') {
+      await adminAuth().updateUser(uid, { emailVerified: true });
+      await adminDb().doc(`users/${uid}`).set({ emailVerified: true, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    }
+    return result;
+  },
+
+  async sendPasswordResetCode(data) {
+    const identifier = requireString(data, 'identifier');
+    const user = await findUser(identifier);
+    if (!user) throw new FnError('not-found', 'No account found with this email or phone number.');
+    if (!user.email) throw new FnError('failed-precondition', 'This account has no email address. Use SMS instead.');
+    if (user.disabled) throw new FnError('permission-denied', 'This account has been disabled.');
+    return issueCode('reset_password', user, sendResetEmail);
+  },
+
+  /**
+   * Forgot password (email): sends the "Password Reset Request" email with a button that opens
+   * <APP_URL>/reset-password?token=…, where the user picks a new password. Valid for 24 hours.
+   */
+  async sendPasswordResetLink(data) {
+    const identifier = requireString(data, 'identifier');
+    const user = await findUser(identifier);
+    if (!user) throw new FnError('not-found', 'No account found with this email or phone number.');
+    if (!user.email) throw new FnError('failed-precondition', 'This account has no email address. Use SMS instead.');
+    if (user.disabled) throw new FnError('permission-denied', 'This account has been disabled.');
+
+    const destination = maskEmail(user.email);
+    const now = Date.now();
+    const ref = adminDb().collection('otp').doc(`reset_link_${user.uid}`);
+    const last = (await ref.get()).data() as { lastSentAt?: Timestamp } | undefined;
+    if (last?.lastSentAt && now - last.lastSentAt.toMillis() < RESEND_COOLDOWN_S * 1000) {
+      const left = Math.ceil((last.lastSentAt.toMillis() + RESEND_COOLDOWN_S * 1000 - now) / 1000);
+      return { status: 'cooldown', destination, retryAfterSeconds: left };
+    }
+
+    const resetToken = randomBytes(32).toString('hex');
+    const tokenRef = adminDb().collection('resetTokens').doc(sha256(resetToken));
+    await tokenRef.set({ uid: user.uid, kind: 'link', expiresAt: Timestamp.fromMillis(now + RESET_LINK_TTL_MS) });
+    await ref.set({ uid: user.uid, lastSentAt: Timestamp.fromMillis(now) });
+
+    try {
+      await sendTemplate(mailSettings(), user.email, 'resetLink', {
+        name: await displayName(user),
+        link: `${appUrl()}/reset-password?token=${resetToken}`,
+      });
+    } catch (e) {
+      console.error('Reset link email failed', e);
+      await Promise.all([tokenRef.delete(), ref.delete()]).catch(() => undefined);
+      throw new FnError('unavailable', 'We couldn’t send the email right now. Please try again.');
+    }
+    return { status: 'sent', destination, cooldownSeconds: RESEND_COOLDOWN_S };
+  },
+
+  /** Used by the reset-password page to check a link before showing the form. */
+  async checkResetToken(data) {
+    const resetToken = requireString(data, 'resetToken', 128);
+    const snap = await adminDb().collection('resetTokens').doc(sha256(resetToken)).get();
+    const t = snap.data() as { uid: string; expiresAt: Timestamp } | undefined;
+    if (!t || t.expiresAt.toMillis() < Date.now()) return { status: 'expired' };
+    const user = await adminAuth().getUser(t.uid);
+    return { status: 'ok', email: user.email ? maskEmail(user.email) : null };
+  },
+
+  async verifyPasswordResetCode(data) {
+    const identifier = requireString(data, 'identifier');
+    const code = requireCode(data);
+    const user = await findUser(identifier);
+    if (!user) return { status: 'expired' } satisfies VerifyResult;
+    const result = await checkCode('reset_password', user.uid, code);
+    if (result.status !== 'ok') return result;
+    const resetToken = randomBytes(32).toString('hex');
+    await adminDb()
+      .collection('resetTokens')
+      .doc(sha256(resetToken))
+      .set({ uid: user.uid, expiresAt: Timestamp.fromMillis(Date.now() + RESET_TOKEN_TTL_MS) });
+    return { status: 'ok', resetToken };
+  },
+
+  /** TEST MODE: "sends" the fixed SMS code (nothing is sent). Same cooldown / lock rules as real codes. */
+  async sendTestSmsResetCode(data) {
+    const code = testSmsCode();
+    const phone = requireString(data, 'phone', 16);
+    if (!isE164(phone)) throw new FnError('invalid-argument', 'Please enter a valid phone number.');
+    const user = await findUser(phone);
+    if (!user) throw new FnError('not-found', 'No account found with this phone number.');
+    if (user.disabled) throw new FnError('permission-denied', 'This account has been disabled.');
+    const ref = otpRef('reset_sms_test', user.uid);
+    const now = Date.now();
+    return adminDb().runTransaction(async (tx) => {
+      const cur = (await tx.get(ref)).data() as OtpDoc | undefined;
+      if (cur?.lockedUntil && cur.lockedUntil.toMillis() > now) {
+        return { status: 'locked', retryAfterSeconds: secondsUntil(cur.lockedUntil, now) };
+      }
+      if (cur?.lastSentAt && now - cur.lastSentAt.toMillis() < RESEND_COOLDOWN_S * 1000) {
+        const left = Math.ceil((cur.lastSentAt.toMillis() + RESEND_COOLDOWN_S * 1000 - now) / 1000);
+        return { status: 'cooldown', destination: phone, retryAfterSeconds: left };
+      }
+      const salt = randomBytes(16).toString('hex');
+      const doc: OtpDoc = {
+        uid: user.uid,
+        purpose: 'reset_sms_test',
+        codeHash: sha256(`${salt}:${code}`),
+        salt,
+        expiresAt: Timestamp.fromMillis(now + CODE_TTL_MS),
+        attempts: 0,
+        lockedUntil: null,
+        lastSentAt: Timestamp.fromMillis(now),
+      };
+      tx.set(ref, doc);
+      return { status: 'sent', destination: phone, cooldownSeconds: RESEND_COOLDOWN_S };
+    });
+  },
+
+  /** TEST MODE: checks the fixed SMS code and returns a reset token (then resetPasswordWithToken). */
+  async verifyTestSmsResetCode(data) {
+    testSmsCode();
+    const phone = requireString(data, 'phone', 16);
+    const code = requireCode(data);
+    const user = isE164(phone) ? await findUser(phone) : null;
+    if (!user) return { status: 'expired' } satisfies VerifyResult;
+    const result = await checkCode('reset_sms_test', user.uid, code);
+    if (result.status !== 'ok') return result;
+    const resetToken = randomBytes(32).toString('hex');
+    await adminDb()
+      .collection('resetTokens')
+      .doc(sha256(resetToken))
+      .set({ uid: user.uid, expiresAt: Timestamp.fromMillis(Date.now() + RESET_TOKEN_TTL_MS) });
+    return { status: 'ok', resetToken };
+  },
+
+  /** Called by the app right after a password change done through the SMS reset path. */
+  async notifyPasswordChanged(_data, uidOrNull) {
+    const uid = requireAuth(uidOrNull);
+    return { sent: await notifyUser(uid, 'passwordChanged') };
+  },
+
+  async resetPasswordWithToken(data) {
+    const resetToken = requireString(data, 'resetToken', 128);
+    const newPassword = data.newPassword;
+    if (typeof newPassword !== 'string' || newPassword.length < 8 || newPassword.length > 4096) {
+      throw new FnError('invalid-argument', 'Password must be at least 8 characters');
+    }
+    const ref = adminDb().collection('resetTokens').doc(sha256(resetToken));
+    const snap = await ref.get();
+    const tokenData = snap.data() as { uid: string; expiresAt: Timestamp } | undefined;
+    if (!tokenData || tokenData.expiresAt.toMillis() < Date.now()) {
+      await ref.delete().catch(() => undefined);
+      return { status: 'expired' };
+    }
+    const user = await adminAuth().getUser(tokenData.uid);
+    if (user.email && (await isSamePassword(user.email, newPassword))) return { status: 'same-password' };
+    await adminAuth().updateUser(tokenData.uid, { password: newPassword });
+    await adminAuth().revokeRefreshTokens(tokenData.uid);
+    await ref.delete();
+    await notifyUser(tokenData.uid, 'passwordChanged');
+    return { status: 'ok' };
+  },
+};
